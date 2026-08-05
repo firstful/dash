@@ -202,12 +202,21 @@ def services_with_probes() -> list[dict]:
 
     def probe_entry(e: dict) -> dict:
         if not e["url"]:
-            e["probe"] = {"status": 0, "detail": "no cluster IP", "ms": 0}
+            e["probe"] = {"status": 0, "detail": "no cluster IP", "ms": 0, "up": False}
             return e
         code, body, ms = http_get(e["url"], timeout=2.5)
-        ok = code in (200, 201, 202, 204, 301, 302, 307, 308) or code in (401, 403)  # reachable + serving
+        # Some services have no route at / (404) but expose /health — retry the
+        # common health paths before declaring down.
+        if code in (404, 405):
+            base = e["url"].rstrip("/")
+            for hp in ("/health", "/healthz", "/health/live"):
+                c2, b2, ms2 = http_get(base + hp, timeout=2.0)
+                if c2 in (200, 201, 202, 204):
+                    code, body, ms = c2, b2, ms2
+                    break
+        up = 100 <= code < 600  # any HTTP response = reachable + serving
         e["probe"] = {"status": code, "detail": body[:120] if isinstance(body, str) else "ok",
-                      "ms": round(ms, 1), "up": bool(code and ok)}
+                      "ms": round(ms, 1), "up": up}
         return e
 
     with ThreadPoolExecutor(max_workers=12) as pool:
