@@ -190,8 +190,10 @@ def services_with_probes() -> list[dict]:
                 svc_port = svc_ref.get("port", 80)
                 info = svc_map.get((ns, svc_name), {})
                 ip = info.get("ip", "")
-                target = info.get("ports", {}).get(str(svc_port)) or svc_port
-                probe_url = f"http://{ip}:{target}/" if ip else ""
+                # Probe the ClusterIP on the SERVICE port: kube-proxy DNATs to
+                # the pod's targetPort (e.g. llm 80 -> pod 8080). Probing the
+                # raw targetPort directly hits nothing (no DNAT rule for it).
+                probe_url = f"http://{ip}:{svc_port}/" if ip else ""
                 entries.append({
                     "host": host,
                     "namespace": ns,
