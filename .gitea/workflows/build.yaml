@@ -20,7 +20,7 @@ jobs:
           apt-get update -qq
           apt-get install -y -qq docker.io >/dev/null
           echo "${{ secrets.REGISTRY_PUSH_TOKEN }}" | docker login 192.168.1.2:3000 -u reeds --password-stdin
-          SHA8=${GITHUB_SHA::8}
+          SHA8=$(echo "$GITHUB_SHA" | cut -c1-8)
           docker build -t 192.168.1.2:3000/reeds/dash:latest -t 192.168.1.2:3000/reeds/dash:${SHA8} .
           docker push 192.168.1.2:3000/reeds/dash:latest
           docker push 192.168.1.2:3000/reeds/dash:${SHA8}
