@@ -123,8 +123,8 @@ def cluster_overview() -> dict:
                 "version": n["status"].get("nodeInfo", {}).get("kubeletVersion", ""),
                 "ip": next((a.get("address") for a in n.get("status", {}).get("addresses", [])
                             if a.get("type") == "InternalIP"), ""),
-                "role": "control-plane" if "control-plane" in (n["metadata"].get("labels") or {}).get(
-                    "node-role.kubernetes.io/control-plane", "") else "worker",
+                "role": "control-plane" if (n["metadata"].get("labels") or {}).get(
+                    "node-role.kubernetes.io/control-plane") else "worker",
             })
     except Exception as e:  # noqa: BLE001
         nodes = [{"error": str(e)}]
