@@ -94,11 +94,19 @@ def _k8s_token() -> str:
         return f.read().strip()
 
 
+def _k8s_ctx():
+    """SSL context trusting the in-cluster serviceaccount CA (self-signed)."""
+    import ssl
+    ctx = ssl.create_default_context()
+    ctx.load_verify_locations("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
+    return ctx
+
+
 def k8s_get(path: str) -> Any:
     """GET an API-server path using the in-cluster SA token."""
     url = "https://kubernetes.default.svc" + path
     req = urllib.request.Request(url, headers={"Authorization": "Bearer " + _k8s_token()})
-    with urllib.request.urlopen(req, timeout=8) as resp:  # noqa: S310 — internal cluster DNS
+    with urllib.request.urlopen(req, timeout=8, context=_k8s_ctx()) as resp:  # noqa: S310 — internal cluster DNS
         return json.loads(resp.read())
 
 
