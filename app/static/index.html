@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1115">
+<title>dash · sutliff</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="dot" id="conn-dot"></span>
+    <h1>dash</h1>
+    <span class="sub" id="clock"></span>
+  </div>
+  <div class="actions">
+    <button id="btn-add" class="btn ghost" title="Show hidden widgets">＋ add</button>
+    <button id="btn-reset" class="btn ghost" title="Reset layout">⟲</button>
+  </div>
+</header>
+
+<div id="add-tray" class="add-tray hidden"></div>
+<main id="grid" class="grid"></main>
+
+<footer class="foot">
+  <span id="last-updated">—</span>
+</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
