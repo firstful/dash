@@ -41,6 +41,12 @@ GITEA_TOKEN = os.getenv("GITEA_TOKEN", "")
 CS_URL = os.getenv("CS_URL", "http://cs-downloader.cs-downloader.svc.cluster.local:8643")
 TELEMETRY_URL = os.getenv("TELEMETRY_URL", "http://telemetry.telemetry.svc.cluster.local:8081")
 REFRESH_TTL = float(os.getenv("REFRESH_TTL", "10"))
+# In-cluster address of the Traefik ingress controller. Service health is
+# probed THROUGH Traefik with the public Host header (see services_with_probes)
+# because that is the path a real client takes; direct ClusterIP probes are
+# blocked by per-namespace egress NetworkPolicies and do not exist at all for
+# headless/ExternalName Services.
+TRAEFIK_HOST = os.getenv("TRAEFIK_HOST", "traefik.kube-system.svc.cluster.local")
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
@@ -163,19 +169,6 @@ def services_with_probes() -> list[dict]:
     except Exception:  # noqa: BLE001
         return [{"error": "cannot list ingressroutes"}]
 
-    # service ClusterIP lookup: (ns, name) -> (ip, port map)
-    svc_map: dict[tuple[str, str], dict[str, Any]] = {}
-    try:
-        for s in k8s_get("/api/v1/services").get("items", []):
-            ports = {p.get("name") or str(p.get("port")): p.get("targetPort") or p.get("port")
-                     for p in s.get("spec", {}).get("ports", [])}
-            svc_map[(s["metadata"]["namespace"], s["metadata"]["name"])] = {
-                "ip": s.get("spec", {}).get("clusterIP", ""),
-                "ports": ports,
-            }
-    except Exception:  # noqa: BLE001
-        pass
-
     entries: list[dict] = []
     for r in routes:
         ns = r["metadata"]["namespace"]
@@ -187,36 +180,44 @@ def services_with_probes() -> list[dict]:
             host = match.split("Host(`", 1)[1].split("`", 1)[0]
             for svc_ref in route.get("services", []):
                 svc_name = svc_ref.get("name", "")
-                svc_port = svc_ref.get("port", 80)
-                info = svc_map.get((ns, svc_name), {})
-                ip = info.get("ip", "")
-                # Probe the ClusterIP on the SERVICE port: kube-proxy DNATs to
-                # the pod's targetPort (e.g. llm 80 -> pod 8080). Probing the
-                # raw targetPort directly hits nothing (no DNAT rule for it).
-                probe_url = f"http://{ip}:{svc_port}/" if ip else ""
+                # Probe through Traefik with the public Host header — the exact
+                # path a browser takes. Probing the Service ClusterIP directly
+                # is unreliable: headless Services have clusterIP "None" (so
+                # there is no address to hit at all), ExternalName Services
+                # have none either, and ClusterIP probes are blocked by
+                # per-namespace egress NetworkPolicies for most workloads.
+                # That produced 25 timeouts / 16 refused / 4 name-resolution
+                # errors and reported 5 of 49 services healthy when the real
+                # figure via Traefik is 25 of 49.
                 entries.append({
                     "host": host,
                     "namespace": ns,
                     "service": svc_name,
-                    "url": probe_url,
+                    "url": f"http://{TRAEFIK_HOST}/",
                     "probe": None,
+                    "probe_host": host,
                 })
 
     def probe_entry(e: dict) -> dict:
         if not e["url"]:
             e["probe"] = {"status": 0, "detail": "no cluster IP", "ms": 0, "up": False}
             return e
-        code, body, ms = http_get(e["url"], timeout=2.5)
+        # Send the public Host header so Traefik routes to the right backend.
+        hdr = {"Host": e.get("probe_host") or e["host"]}
+        code, body, ms = http_get(e["url"], timeout=2.5, headers=hdr)
         # Some services have no route at / (404) but expose /health — retry the
         # common health paths before declaring down.
         if code in (404, 405):
             base = e["url"].rstrip("/")
             for hp in ("/health", "/healthz", "/health/live"):
-                c2, b2, ms2 = http_get(base + hp, timeout=2.0)
+                c2, b2, ms2 = http_get(base + hp, timeout=2.0, headers=hdr)
                 if c2 in (200, 201, 202, 204):
                     code, body, ms = c2, b2, ms2
                     break
-        up = 100 <= code < 600  # any HTTP response = reachable + serving
+        # A 5xx means Traefik had no healthy backend for that host — the
+        # service is genuinely down. Anything else (2xx/3xx/4xx) proves the
+        # request reached a live backend that chose to answer that way.
+        up = 100 <= code < 500
         e["probe"] = {"status": code, "detail": body[:120] if isinstance(body, str) else "ok",
                       "ms": round(ms, 1), "up": up}
         return e
