@@ -4,7 +4,7 @@
  */
 "use strict";
 
-const LS_KEY = "dash.widgets.v1";
+const LS_KEY = "dash.widgets.v2";
 const POLL = 10000;       // default widget refresh
 const FEED_POLL = 5000;   // live feed refresh
 
@@ -22,7 +22,60 @@ const fmtTime = (s) => {
   return isNaN(d) ? String(s) : d.toLocaleTimeString([], { hour12: false });
 };
 
+// Defensive escaping for any value interpolated into innerHTML.
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
 const WIDGETS = {
+  findings: {
+    title: "Cron findings · high salience",
+    full: true,
+    refresh: FEED_POLL,
+    async load() { return jget("/api/findings?limit=40"); },
+    render(el, d) {
+      const list = d.findings || [];
+      if (!list.length) { el.innerHTML = `<div class="empty">no findings reported</div>`; return; }
+      el.innerHTML = `<div class="feed">${list.map(f => {
+        const cls = f.severity === "critical" ? "bad" : (f.severity === "warn" ? "warn" : "ok");
+        const detail = f.detail ? `<br><span class="muted">${esc(f.detail)}</span>` : "";
+        const src = f.source ? `<span class="muted">${esc(f.source)}</span>` : "";
+        const times = f.count > 1 ? ` ×${esc(f.count)}` : "";
+        return `<div class="row">
+          <span class="pill"><span class="dot ${cls}"></span>${esc(f.severity)}</span>
+          <span class="grow"><span class="svc-name">${esc(f.title)}${times}</span>${detail}</span>
+          ${src}<span class="muted mono">${esc(fmtTime(f.ts))}</span>
+        </div>`;
+      }).join("")}</div>`;
+    },
+  },
+
+  wakeable: {
+    title: "Wakeable services",
+    refresh: POLL,
+    async load() { return jget("/api/wakeable"); },
+    render(el, d) {
+      const list = d.services || [];
+      if (list.error) { el.innerHTML = `<div class="err">${esc(list.error)}</div>`; return; }
+      const awake = list.filter(s => s.state === "awake").length;
+      const parked = list.filter(s => s.state === "parked").length;
+      el.innerHTML = `
+        <div class="hero">
+          <div class="stat"><b class="ok">${awake}</b><span>awake</span></div>
+          <div class="stat"><b class="warn">${parked}</b><span>parked</span></div>
+          <div class="stat"><b>${list.length}</b><span>total</span></div>
+        </div>
+        ${list.map(s => {
+          const cls = s.state === "awake" ? "ok" : "";
+          const label = s.host || s.name;
+          const sub = s.host ? `<br><span class="svc-host">${esc(s.name)}·${esc(s.namespace)}</span>` : "";
+          return `<div class="row">
+            <span class="pill"><span class="dot ${cls}"></span>${esc(s.state)}</span>
+            <span class="grow"><span class="svc-name">${esc(label)}</span>${sub}</span>
+            <span class="muted">${esc(s.idle_minutes)}m</span>
+          </div>`;
+        }).join("")}`;
+    },
+  },
+
   cluster: {
     title: "Cluster",
     refresh: POLL,

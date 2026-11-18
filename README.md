@@ -15,6 +15,8 @@ widgets) is stored per-browser in localStorage.
 | Worker queues · live | cs-downloader `/api/downloads` + Gitea Actions runs |
 | Gitea commits & builds | Gitea API (repos, commits, actions/runs) |
 | Telemetry · live feed | telemetry internal `/feed` (port 8081, cluster-only) |
+| Cron findings · high salience | POSTed by cron helper, persisted in `FINDINGS_FILE` |
+| Wakeable services | Deployments labelled `rook.io/lifecycle=wakeable` (state: awake/parked) |
 
 ## Deploy
 
@@ -39,4 +41,22 @@ GET /api/services      ingressroute services + probe, up-first
 GET /api/queues        cs-downloader queue + Actions runs
 GET /api/gitea         repos: commits + runs
 GET /api/telemetry     proxy to telemetry /feed?limit=N
+GET /api/wakeable      wakeable deployments (label rook.io/lifecycle=wakeable)
+GET /api/findings      cron findings feed (query: ?limit=N, 1-200)
+POST /api/findings     report a finding (header X-Findings-Token required)
 ```
+
+### Findings API
+
+`POST /api/findings` accepts JSON `{title, detail?, source?, severity?}` and
+requires the `X-Findings-Token` header (matching `FINDINGS_TOKEN` env, or the
+POST is rejected with 401). `severity` is one of `info|warn|critical`
+(defaults to `info`). Findings are deduplicated on `(source, title)`: a repeat
+refreshes its timestamp/detail/severity and increments `×count`. They are
+persisted to `FINDINGS_FILE` (default `/tmp/dash-findings.json`, survives
+restart) and capped at `FINDINGS_MAX` (default 100). `GET /api/findings?limit=N`
+returns the newest findings first.
+
+`/api/wakeable` lists Deployments labelled `rook.io/lifecycle=wakeable` with
+their wake host/service/idle config and `state` (`awake` when desired or ready
+replicas > 0, else `parked`), sourced from the in-cluster k8s API.

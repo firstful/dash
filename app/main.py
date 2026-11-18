@@ -12,6 +12,9 @@ Endpoints:
   GET /api/queues        worker queues (cs-downloader + Gitea Actions)
   GET /api/gitea         repos: recent commits + recent Actions runs
   GET /api/telemetry     proxy to telemetry /feed (internal port 8081)
+  GET /api/wakeable      wakeable deployments (label rook.io/lifecycle=wakeable)
+  GET /api/findings      cron high-salience findings feed
+  POST /api/findings     report a finding (X-Findings-Token required)
 
 Env:
   PORT            listen port (default 8650)
@@ -20,18 +23,24 @@ Env:
   CS_URL          cs-downloader internal URL (default http://cs-downloader.cs-downloader.svc.cluster.local:8643)
   TELEMETRY_URL   telemetry internal feed URL (default http://telemetry.telemetry.svc.cluster.local:8081)
   REFRESH_TTL     server-side cache TTL for slow aggregations (default 10s)
+  FINDINGS_TOKEN  token required by POST /api/findings (empty disables writes)
+  FINDINGS_FILE   JSON file used to persist findings (default /tmp/dash-findings.json)
+  FINDINGS_MAX    max findings retained (default 100)
 """
 from __future__ import annotations
 
 import json
 import os
+import secrets
+import threading
 import time
+import urllib.parse
 import urllib.request
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Optional
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, HTTPException, Header
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -49,6 +58,40 @@ REFRESH_TTL = float(os.getenv("REFRESH_TTL", "10"))
 TRAEFIK_HOST = os.getenv("TRAEFIK_HOST", "traefik.kube-system.svc.cluster.local")
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+
+# Findings feed (cron high-salience reports). Persisted to a plain JSON file
+# so findings survive a restart without needing a PVC.
+FINDINGS_TOKEN = os.getenv("FINDINGS_TOKEN", "")
+FINDINGS_FILE = os.getenv("FINDINGS_FILE", "/tmp/dash-findings.json")
+FINDINGS_MAX = int(os.getenv("FINDINGS_MAX", "100"))
+_findings: list[dict] = []
+_findings_lock = threading.Lock()
+
+
+def _load_findings() -> list[dict]:
+    """Best-effort load of persisted findings; storage failure never breaks the app."""
+    try:
+        with open(FINDINGS_FILE, "r") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return [x for x in data if isinstance(x, dict)][:FINDINGS_MAX]
+    except Exception:  # noqa: BLE001 — missing/unreadable/malformed file
+        pass
+    return []
+
+
+def _save_findings(items: list[dict]) -> None:
+    """Atomic write of findings JSON; storage failure is intentionally swallowed."""
+    tmp = FINDINGS_FILE + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(items[:FINDINGS_MAX], f)
+        os.replace(tmp, FINDINGS_FILE)
+    except Exception:  # noqa: BLE001 — read-only fs / disk full / etc.
+        pass
+
+
+_findings = _load_findings()
 
 app = FastAPI(title="dash", docs_url=None, redoc_url=None)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -156,6 +199,47 @@ def cluster_overview() -> dict:
         pass
     return {"nodes": nodes, "namespaces": namespaces, "deployments": deployments,
             "pods": pods, "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+
+
+@cached("wakeable")
+def wakeable_services() -> list[dict]:
+    """Deployments labelled rook.io/lifecycle=wakeable, with wake config + state."""
+    try:
+        deps = k8s_get("/apis/apps/v1/deployments?labelSelector=" +
+                       urllib.parse.quote("rook.io/lifecycle=wakeable", safe="")).get("items", [])
+    except Exception:  # noqa: BLE001
+        return [{"error": "cannot list wakeable deployments"}]
+
+    entries: list[dict] = []
+    for d in deps:
+        meta = d.get("metadata", {})
+        ann = meta.get("annotations") or {}
+        spec = d.get("spec", {})
+        status = d.get("status", {})
+        desired = spec.get("replicas") or 0
+        ready = status.get("readyReplicas") or 0
+        hosts_raw = ann.get("rook.io/wake-host") or ""
+        hosts = [h.strip() for h in hosts_raw.split(",") if h.strip()]
+        idle = ann.get("rook.io/wake-idle-minutes", "")
+        try:
+            idle_minutes = int(idle)
+        except (TypeError, ValueError):
+            idle_minutes = 0
+        entries.append({
+            "namespace": meta.get("namespace", ""),
+            "name": meta.get("name", ""),
+            "hosts": hosts,
+            "host": hosts[0] if hosts else "",
+            "service": ann.get("rook.io/wake-svc", ""),
+            "wake_by": ann.get("rook.io/wake-by", ""),
+            "idle_minutes": idle_minutes,
+            "desired": desired,
+            "ready": ready,
+            "state": "awake" if desired > 0 or ready > 0 else "parked",
+        })
+    # awake first, then by host/name
+    entries.sort(key=lambda e: (0 if e["state"] == "awake" else 1, e["host"], e["name"]))
+    return entries
 
 
 # ---------------------------------------------------------------- services
@@ -362,6 +446,54 @@ def api_queues():
 @app.get("/api/gitea")
 def api_gitea():
     return gitea_data()
+
+
+@app.get("/api/wakeable")
+def api_wakeable():
+    return {"services": wakeable_services(),
+            "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+
+
+@app.get("/api/findings")
+def api_findings(limit: int = Query(50, ge=1, le=200)):
+    return {"findings": _findings[:limit], "count": len(_findings)}
+
+
+@app.post("/api/findings")
+def post_findings(payload: dict, x_findings_token: str = Header(default="")):
+    if not FINDINGS_TOKEN or not secrets.compare_digest(x_findings_token, FINDINGS_TOKEN):
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+    title = payload.get("title")
+    if not isinstance(title, str) or not title.strip():
+        raise HTTPException(status_code=400, detail="title required")
+    title = title.strip()[:200]
+    detail = str(payload.get("detail") or "")[:2000]
+    source = str(payload.get("source") or "")[:80]
+    severity = payload.get("severity")
+    if severity not in ("info", "warn", "critical"):
+        severity = "info"
+    ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    global _findings
+    with _findings_lock:
+        entry = None
+        for existing in _findings:
+            if existing.get("source") == source and existing.get("title") == title:
+                entry = existing
+                break
+        if entry is not None:
+            entry.update({"ts": ts, "detail": detail, "severity": severity,
+                          "count": int(entry.get("count", 1)) + 1})
+        else:
+            entry = {"title": title, "detail": detail, "severity": severity,
+                     "source": source, "ts": ts, "count": 1}
+            _findings.insert(0, entry)
+        _findings.sort(key=lambda f: f.get("ts", ""), reverse=True)
+        _findings = _findings[:FINDINGS_MAX]
+        _save_findings(_findings)
+
+    return {"ok": True, "finding": entry}
 
 
 @app.get("/")
